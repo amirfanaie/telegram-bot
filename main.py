@@ -1,181 +1,104 @@
 # -*- coding: utf-8 -*-
-# main.py — PuzzleGold userbot relay for Render
-# Relays only "آبشده خرد/ابشده خرد" messages from CHANNEL_A to CHANNEL_B,
-# edits first "خرید" after "هر مثقال" (-460,000) and first after "هر گرم" (-100,000),
-# and replaces links @shemshineh -> @puzzlegold (configurable via env).
+# main.py — PuzzleGold relay (Render-friendly)
 
-import os
-import re
-import threading
-import logging
+import os, re, threading, logging
 from typing import Optional
-
 from flask import Flask
 from telethon import events
 from telethon.sessions import StringSession
 from telethon import TelegramClient
 
-# ---------------------------- Logging ----------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
 log = logging.getLogger("puzzlegold")
 
-# ------------------------- Keep-alive web -------------------------
+# --------- ENV ---------
+API_ID        = os.getenv("API_ID")          # بعداً واقعی می‌گذاری
+API_HASH      = os.getenv("API_HASH")        # بعداً واقعی می‌گذاری
+SESSION_STRING= os.getenv("SESSION_STRING")  # بعداً واقعی می‌گذاری
+SOURCE        = os.getenv("SOURCE_CHANNEL", "shemshineh")
+DEST          = os.getenv("DEST_CHANNEL", "puzzlegold")
+
+RUN_USERBOT = bool(SESSION_STRING and API_ID and API_HASH)
+
+# --------- Flask keepalive ---------
 app = Flask(__name__)
 
 @app.get("/")
-def home():
-    return "puzzlegold relay running", 200
+def ok():
+    return "PuzzleGold relay is running.", 200
 
-def run_web():
-    port = int(os.environ.get("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
 
-threading.Thread(target=run_web, daemon=True).start()
+# --------- Text helpers ---------
+def fa_num_to_int(s: str) -> Optional[int]:
+    # تبدیل ارقام فارسی/عربی به انگلیسی و حذف جداکننده‌ها
+    trans = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+    cleaned = re.sub(r"[^\d]", "", s.translate(trans))
+    return int(cleaned) if cleaned else None
 
-# --------------------------- Config -------------------------------
-API_ID    = int(os.environ["API_ID"])
-API_HASH  = os.environ["API_HASH"]
-SESSION_STRING = os.environ["SESSION_STRING"]  # باید از قبل تولید و در Env بگذاری
+def tweak_text(text: str) -> Optional[str]:
+    # فقط پیام‌هایی که تیتر «ابشده خرد» دارند
+    if not re.search(r"(?i)ابشده\s*خرد", text):
+        return None
 
-CHANNEL_A = os.environ.get("CHANNEL_A", "@shemshineh")
-CHANNEL_B = os.environ.get("CHANNEL_B", "@puzzlegold")
+    out = text
 
-# کسورات
-DEDUCT_MESGHAL = 460_000   # هر مثقال → اولین «خرید»
-DEDUCT_GRAM    = 100_000   # هر گرم   → اولین «خرید»
+    # هر مثقال → اولین «خرید» و کم کردن 460,000
+    m_methqal = re.search(r"(هر\s*مثقال.*?)(خرید\s*:\s*[^0-9۰-۹]+)?([0-9۰-۹\.,]+)", out, flags=re.S)
+    if m_methqal:
+        amount = fa_num_to_int(m_methqal.group(3))
+        if amount:
+            amount -= 460000
+            out = out.replace(m_methqal.group(3), f"{amount:,}")
 
-FA_DIGITS = "۰۱۲۳۴۵۶۷۸۹"
-EN_DIGITS = "0123456789"
+    # هر گرم → اولین «خرید» و کم کردن 100,000
+    m_gram = re.search(r"(هر\s*گرم.*?)(خرید\s*:\s*[^0-9۰-۹]+)?([0-9۰-۹\.,]+)", out, flags=re.S)
+    if m_gram:
+        amount = fa_num_to_int(m_gram.group(3))
+        if amount:
+            amount -= 100000
+            out = out.replace(m_gram.group(3), f"{amount:,}")
 
-def fa_to_en(text: str) -> str:
-    """تبدیل ارقام فارسی/عربی به انگلیسی + نرمال‌سازی جداکننده‌ها و کالن‌ها"""
-    arabic_digits = "٠١٢٣٤٥٦٧٨٩"
-    # digits
-    for i, d in enumerate(FA_DIGITS):
-        text = text.replace(d, EN_DIGITS[i])
-    for i, d in enumerate(arabic_digits):
-        text = text.replace(d, EN_DIGITS[i])
-    # separators
-    text = (text
-            .replace("٬", ",")   # Arabic thousands separator
-            .replace("،", ",")   # Persian comma
-            .replace("’", "'")
-            .replace("：", ":")   # full-width colon
-            )
-    return text
+    # جایگزینی لینک منبع با کانال مقصد
+    out = re.sub(r"@shemshineh", "@puzzlegold", out, flags=re.I)
 
-def en_to_fa_digits(text: str) -> str:
-    out = []
-    for ch in text:
-        if "0" <= ch <= "9":
-            out.append(FA_DIGITS[ord(ch) - ord("0")])
+    return out
+
+# --------- Telethon (اختیاری تا وقتی SESSION_STRING داری) ---------
+client = None
+if RUN_USERBOT:
+    client = TelegramClient(StringSession(SESSION_STRING), int(API_ID), API_HASH)
+
+    @client.on(events.NewMessage(chats=SOURCE))
+    async def relay_handler(ev):
+        txt = ev.message.message or ""
+        new_txt = tweak_text(txt)
+        if new_txt:
+            try:
+                await client.send_message(DEST, new_txt)
+                log.info("Relayed a tweaked message.")
+            except Exception as e:
+                log.exception("Send failed: %s", e)
         else:
-            out.append(ch)
-    return "".join(out)
+            log.info("Skipped (no 'ابشده خرد').")
 
-def format_int_fa(n: int) -> str:
-    """فرمت با جداکننده هزاران و ارقام فارسی"""
-    s = f"{n:,}"  # 12,345,678
-    return en_to_fa_digits(s)
+def main():
+    # Flask thread
+    t = threading.Thread(target=run_flask, daemon=True)
+    t.start()
 
-def replace_links(text: str, src_username: str, dst_username: str) -> str:
-    """تعویض تمام ارجاعات از کانال مبدا به کانال مقصد"""
-    src = src_username.lstrip("@")
-    dst = dst_username if dst_username.startswith("@") else f"@{dst_username}"
-    variants = [
-        f"@{src}",
-        f"t.me/{src}",
-        f"http://t.me/{src}",
-        f"https://t.me/{src}",
-    ]
-    for v in variants:
-        text = text.replace(v, dst)
-    return text
+    if RUN_USERBOT:
+        log.info("Starting Telethon client...")
+        client.start()
+        log.info("Userbot is running. Watching channel: @%s", SOURCE)
+        client.run_until_disconnected()
+    else:
+        log.warning("SESSION_STRING/APIs not set. Only Flask is running.")
+        t.join()
 
-def replace_section_buy(original_text: str, section_keywords, deduct_amount: int) -> str:
-    """
-    از اولین رخداد یکی از section_keywords به بعد،
-    اولین الگوی «خرید : عدد» را پیدا می‌کنیم و deduct می‌زنیم (فقط یک بار).
-    """
-    t_en = fa_to_en(original_text)
-    # locate section start
-    idx = -1
-    for kw in section_keywords:
-        p = t_en.find(kw)
-        if p != -1 and (idx == -1 or p < idx):
-            idx = p
-    if idx == -1:
-        return original_text  # section not found
-
-    head, tail = t_en[:idx], t_en[idx:]
-    # pattern: خرید : 12,345,678
-    m = re.search(r"(خرید)\s*[::]?\s*([0-9,]+)", tail)
-    if not m:
-        return original_text
-
-    old_num = int(m.group(2).replace(",", ""))
-    new_num = max(0, old_num - deduct_amount)
-    replacement = f"{m.group(1)} : {new_num:,}"
-
-    tail_new = tail[:m.start()] + replacement + tail[m.end():]
-    t_new = head + tail_new
-
-    # فقط ارقام را فارسی کن (متن فارسی حفظ می‌شود)
-    return en_to_fa_digits(t_new)
-
-def should_process(text: Optional[str]) -> bool:
-    if not text:
-        return False
-    # قبول هر دو املا: آبشده/ابشده
-    needles = ("آبشده خرد", "ابشده خرد")
-    return any(n in text for n in needles)
-
-def process_message_text(text: str) -> str:
-    """ویرایش متن طبق منطق کسب‌وکار و تعویض لینک‌ها"""
-    # هر مثقال → -460k
-    text = replace_section_buy(
-        text, section_keywords=["هر مثقال", "هرمثقال"], deduct_amount=DEDUCT_MESGHAL
-    )
-    # هر گرم/هرگرم → -100k
-    text = replace_section_buy(
-        text, section_keywords=["هر گرم", "هرگرم"], deduct_amount=DEDUCT_GRAM
-    )
-    # تعویض لینک‌ها
-    text = replace_links(text, src_username=CHANNEL_A, dst_username=CHANNEL_B)
-    return text
-
-# ----------------------- Telethon client --------------------------
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-
-@client.on(events.NewMessage(chats=[CHANNEL_A]))
-async def handler(event):
-    try:
-        text = event.raw_text or ""
-        if not should_process(text):
-            return
-        new_text = process_message_text(text)
-        if new_text.strip():
-            await client.send_message(CHANNEL_B, new_text)
-            log.info("Relayed a processed message to %s", CHANNEL_B)
-    except Exception as e:
-        log.exception("Error processing message: %s", e)
-
-async def on_startup():
-    try:
-        me = await client.get_me()
-        log.info("Logged in as %s (%s)", me.first_name, me.id)
-        # warm up entities (optional)
-        await client.get_entity(CHANNEL_A)
-        await client.get_entity(CHANNEL_B)
-        log.info("Watching %s → %s", CHANNEL_A, CHANNEL_B)
-    except Exception as e:
-        log.exception("Startup error: %s", e)
-
-# ----------------------------- Run --------------------------------
 if __name__ == "__main__":
-    log.info("Starting PuzzleGold relay…")
-    client.loop.run_until_complete(on_startup())
-    client.run_until_disconnected()
+    main()
